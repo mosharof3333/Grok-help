@@ -49,80 +49,82 @@ class PolymarketClient:
         print(f"[bot] Initialized | Sig: {SIGNATURE_TYPE} | Dry-run: {DRY_RUN} | Shares: {SHARES_PER_TRADE}")
 
     def extract_tokens(self, market: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-        """Robust extraction of Yes (Up) and No (Down) token IDs"""
-        # Try clobTokenIds first
+        """Force string conversion + multiple fallbacks"""
+        # clobTokenIds
         clob = market.get("clobTokenIds")
         if clob:
             if isinstance(clob, list) and len(clob) >= 2:
                 return str(clob[0]), str(clob[1])
             if isinstance(clob, str):
                 try:
-                    ids = json.loads(clob)
+                    ids = json.loads(clob.replace("'", '"'))
                     if isinstance(ids, list) and len(ids) >= 2:
                         return str(ids[0]), str(ids[1])
                 except:
                     pass
 
-        # Fallback to tokens array
+        # tokens array
         tokens = market.get("tokens", [])
         if tokens and len(tokens) >= 2:
-            yes_id = next((str(t.get("token_id") or t.get("clobTokenId")) for t in tokens if t.get("outcome") in ["Yes", "1", "Up"]), None)
-            no_id = next((str(t.get("token_id") or t.get("clobTokenId")) for t in tokens if t.get("outcome") in ["No", "0", "Down"]), None)
+            yes_id = None
+            no_id = None
+            for t in tokens:
+                tid = str(t.get("token_id") or t.get("clobTokenId") or t.get("id") or "")
+                outcome = str(t.get("outcome", "")).lower()
+                if outcome in ["yes", "1", "up"]:
+                    yes_id = tid
+                elif outcome in ["no", "0", "down"]:
+                    no_id = tid
             if yes_id and no_id:
                 return yes_id, no_id
 
         return None, None
 
     def find_current_market(self, asset: str, window: str) -> Optional[Dict]:
-        # 1. Timestamp method (most accurate for live windows)
         minutes_map = {"5m": 5, "15m": 15, "4h": 240}
-        interval_sec = minutes_map.get(window, 5) * 60
+        interval_sec = minutes_map.get(window, 300) * 60
         now = int(time.time())
 
-        for offset in [0, -interval_sec, -300, 300, -600, interval_sec]:
+        # Timestamp slug tries
+        for offset in [0, -interval_sec, -300, 300, -600]:
             ts = ((now + offset) // interval_sec) * interval_sec
             slug = f"{asset.lower()}-updown-{window}-{ts}"
             market = self._fetch_by_slug(slug)
             if market:
                 yes_t, no_t = self.extract_tokens(market)
                 if yes_t and no_t:
-                    print(f"[find_market] Found via slug: {market.get('question','')[:80]}")
-                    return {"yes_token_id": yes_t, "no_token_id": no_t, "question": market.get("question", "")}
+                    print(f"[find_market] Found via slug: {market.get('question', '')[:100]}")
+                    return {"yes_token_id": yes_t, "no_token_id": no_t, "question": market.get("question", ""), "raw": market}
         
-        # 2. Search fallback using active markets
-        print(f"[find_market] Timestamp miss → searching for {asset.upper()}/{window}...")
+        # Search fallback
+        print(f"[find_market] Searching active markets for {asset.upper()}/{window}...")
         try:
-            resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"active": "true", "closed": "false", "limit": 300},
-                timeout=15
-            )
+            resp = requests.get("https://gamma-api.polymarket.com/markets", 
+                                params={"active": "true", "closed": "false", "limit": 300}, timeout=15)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
-                    search_term = f"{asset.upper()} Up or Down"
                     for m in data:
                         q = m.get("question", "").lower()
-                        if search_term.lower() in q and window in q:
+                        if f"{asset.lower()} up or down" in q and window in q:
                             yes_t, no_t = self.extract_tokens(m)
                             if yes_t and no_t:
-                                print(f"[find_market] Found via search: {m.get('question','')[:80]}")
-                                return {"yes_token_id": yes_t, "no_token_id": no_t, "question": m.get("question", "")}
+                                print(f"[find_market] Found via search: {m.get('question','')[:100]}")
+                                return {"yes_token_id": yes_t, "no_token_id": no_t, "question": m.get("question", ""), "raw": m}
         except Exception as e:
             print(f"[search error] {e}")
         
-        print(f"[find_market] No tradable {asset.upper()}/{window} market yet")
+        print(f"[find_market] No active tradable {asset.upper()}/{window} market")
         return None
 
     def _fetch_by_slug(self, slug: str) -> Optional[Dict]:
         for base in ["https://gamma-api.polymarket.com/markets", "https://gamma-api.polymarket.com/events"]:
-            url = f"{base}?slug={slug}"
             try:
-                resp = requests.get(url, timeout=10)
+                resp = requests.get(f"{base}?slug={slug}", timeout=10)
                 if resp.status_code == 200:
                     data = resp.json()
                     if data:
-                        return data[0] if isinstance(data, list) and data else data
+                        return data[0] if isinstance(data, list) and len(data) > 0 else data
             except:
                 continue
         return None
@@ -130,12 +132,18 @@ class PolymarketClient:
     def best_ask(self, token_id: str) -> Optional[float]:
         if not token_id:
             return None
+        token_id = str(token_id).strip()  # Force string
         try:
             price = self.client.get_price(token_id, side="BUY")
-            return float(price) if price is not None else None
+            if price is not None:
+                return float(price)
+            return None
         except Exception as e:
-            if "404" not in str(e) and "No orderbook" not in str(e):
-                print(f"[best_ask error for {token_id[:20]}...] {type(e).__name__}")
+            err_str = str(e)
+            if "404" in err_str or "No orderbook" in err_str:
+                print(f"[best_ask] No orderbook yet for token {token_id[:20]}... (normal for new window)")
+            else:
+                print(f"[best_ask error] token={token_id[:30]}... | {type(e).__name__}: {err_str[:150]}")
             return None
 
     def buy(self, token_id: str, price: float, shares: float, comment: str):
@@ -144,7 +152,7 @@ class PolymarketClient:
             return
         print(f"[BUY] {comment}")
         try:
-            order = OrderArgs(token_id=token_id, price=price, size=shares, side=BUY)
+            order = OrderArgs(token_id=str(token_id), price=price, size=shares, side=BUY)
             signed = self.client.create_order(order)
             resp = self.client.post_order(signed, OrderType.GTC)
             print(f"[BUY SUCCESS] {resp}")
@@ -157,18 +165,11 @@ def get_snapshot(client: PolymarketClient, asset: str, window: str) -> Optional[
         return None
     up = client.best_ask(market["yes_token_id"])
     down = client.best_ask(market["no_token_id"])
-    print(f"[{asset.upper()}/{window}] up={up} down={down} | {market.get('question','')[:90]}")
+    print(f"[{asset.upper()}/{window}] up={up} down={down} | {market.get('question','')[:100]}")
     if up is None or down is None:
         return None
-    return Snapshot(
-        asset=asset,
-        yes_token=market["yes_token_id"],
-        no_token=market["no_token_id"],
-        up_ask=up,
-        down_ask=down,
-    )
+    return Snapshot(asset=asset, yes_token=market["yes_token_id"], no_token=market["no_token_id"], up_ask=up, down_ask=down)
 
-# check_window, run() functions remain the same as previous version
 def check_window(client: PolymarketClient, window: str):
     btc = get_snapshot(client, "BTC", window)
     eth = get_snapshot(client, "ETH", window)
@@ -189,7 +190,7 @@ def check_window(client: PolymarketClient, window: str):
         client.buy(btc.no_token, btc.down_ask, SHARES_PER_TRADE, f"BTC DOWN @ {btc.down_ask:.3f} [{window}]")
 
 def run():
-    print(f"[bot] BTC/ETH Correlation Arbitrage Bot started | Dry-run: {DRY_RUN} | Poll: {POLL_INTERVAL_SEC}s")
+    print(f"[bot] BTC/ETH Correlation Arbitrage started | Dry-run: {DRY_RUN}")
     client = PolymarketClient()
     while True:
         try:
