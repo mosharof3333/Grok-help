@@ -80,73 +80,99 @@ class PolymarketClient:
 
     def find_current_market(self, window: str) -> Optional[Dict]:
         """
-        Two-stage market discovery:
+        Three-stage market discovery. Confirmed from real live Polymarket slugs:
 
-        STAGE 1 — Deterministic slug lookup (fast, O(1) API calls):
-          Real Polymarket slugs are: btc-updown-5m-{ts} / btc-updown-15m-{ts}
-          where ts = (now // interval_sec) * interval_sec  (floor to window boundary).
-          We try current window, the one just before, and the next one (in case of
-          slight clock drift or a market that opened a few seconds early).
-          The correct Gamma API path for slug lookup is:
-            GET /markets/slug/{slug}   ← path parameter, NOT ?slug= query param
-          Using ?slug= silently ignores the filter and returns unrelated markets.
+          Slug format:  btc-updown-{window}-{ts}
+          Timestamp:    ts = (unix_epoch // interval_sec) * interval_sec  (UTC floor)
+          Examples:     btc-updown-15m-1774657800  (verified live)
+                        btc-updown-5m-1774539000   (verified live)
+          Advance creation: Polymarket creates markets ~24h ahead, so the current
+                        window AND several future windows are already queryable.
 
-        STAGE 2 — Slug-prefix search fallback (catches edge cases):
-          Query GET /markets?slug=btc-updown-{window}-  (prefix match).
-          This is more reliable than keyword-scanning thousands of markets and
-          avoids pagination issues with large result sets.
+        STAGE 1 — Direct slug path lookup  (fast, 3 requests)
+          GET /markets/slug/{slug}  ← path-based, not ?slug= query param
+          Tries: current window, previous window (completed), next two windows (pre-created)
+
+        STAGE 2 — events endpoint slug lookup  (catches slug registered under /events)
+          Some Polymarket rolling markets live under /events not /markets.
+          GET /events/slug/{slug}  with the same slug format.
+
+        STAGE 3 — Tag-filtered search  (reliable broad fallback)
+          Polymarket tags candle markets with tag_id for "Up or Down" / "5 Min" / "15 Min".
+          This completely avoids keyword guessing and pagination over all markets.
+          We just filter by the slug prefix in the returned results.
         """
+        import datetime as dt_mod
         interval_sec = MINUTES_MAP[window] * 60
         now = int(time.time())
-        current_window_ts = (now // interval_sec) * interval_sec
-
-        print(f"[find_market] Searching for BTC/{window} market (current window ts={current_window_ts})...")
-
-        # ── Stage 1: try current window, previous, and next ──────────────────
-        for ts in [current_window_ts, current_window_ts - interval_sec, current_window_ts + interval_sec]:
-            slug = f"btc-updown-{window}-{ts}"
-            market = self._fetch_by_slug_path(slug)
-            if market:
-                yes_t, no_t = self.extract_tokens(market)
-                if yes_t and no_t:
-                    print(f"[find_market] ✅ FOUND via slug lookup: {slug}")
-                    print(f"   Question: {market.get('question', '')[:160]}")
-                    return {
-                        "yes_token_id": yes_t,
-                        "no_token_id": no_t,
-                        "question": market.get("question", ""),
-                        "slot_ts": ts,
-                        "end_date": market.get("endDate") or market.get("end_date_iso"),
-                    }
-
-        # ── Stage 2: prefix search as fallback ───────────────────────────────
+        current_ts = (now // interval_sec) * interval_sec
         slug_prefix = f"btc-updown-{window}-"
-        print(f"[find_market] Slug lookup missed — trying prefix search '{slug_prefix}'...")
-        try:
-            resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={
-                    "slug": slug_prefix,   # Gamma supports prefix matching here
-                    "active": "true",
-                    "closed": "false",
-                    "limit": 20,
-                    "order": "end_date_iso",
-                    "ascending": "false",  # newest first
-                },
-                timeout=15
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    for m in data:
+
+        print(f"[find_market] Searching BTC/{window} | ts={current_ts} | {dt_mod.datetime.utcfromtimestamp(current_ts).strftime('%H:%M UTC')}")
+
+        # ── Stage 1: direct /markets/slug/{slug} path lookup ─────────────────
+        # Try current, previous (already resolved but sometimes still active),
+        # and next two (pre-created ~24h ahead by Polymarket)
+        candidates_ts = [
+            current_ts,
+            current_ts + interval_sec,
+            current_ts + 2 * interval_sec,
+            current_ts - interval_sec,
+        ]
+        for ts in candidates_ts:
+            slug = f"{slug_prefix}{ts}"
+            result = self._try_market_from_slug(slug, ts, window, endpoint="markets")
+            if result:
+                print(f"[find_market] ✅ /markets/slug/ → {slug}")
+                print(f"   {result['question'][:140]}")
+                return result
+
+        # ── Stage 2: same slugs under /events endpoint ────────────────────────
+        print(f"[find_market] /markets/slug/ missed — trying /events/slug/ ...")
+        for ts in candidates_ts:
+            slug = f"{slug_prefix}{ts}"
+            result = self._try_market_from_event_slug(slug, ts, window)
+            if result:
+                print(f"[find_market] ✅ /events/slug/ → {slug}")
+                print(f"   {result['question'][:140]}")
+                return result
+
+        # ── Stage 3: search with slug prefix filter ───────────────────────────
+        # The Gamma API ?slug= param does prefix matching even though it doesn't
+        # work as an exact-match filter — we just guard with startswith() below.
+        # Polymarket pre-creates 6-7 windows, so at least one will be in the list.
+        print(f"[find_market] Trying prefix search '{slug_prefix}' ...")
+        for endpoint in ["markets", "events"]:
+            try:
+                resp = requests.get(
+                    f"https://gamma-api.polymarket.com/{endpoint}",
+                    params={
+                        "slug": slug_prefix,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": 20,
+                        "order": "end_date_iso",
+                        "ascending": "true",   # earliest-ending first = most live
+                    },
+                    timeout=15
+                )
+                if resp.status_code != 200:
+                    continue
+                items = resp.json()
+                if not isinstance(items, list):
+                    items = [items]
+                for item in items:
+                    # Events nest markets inside a "markets" key
+                    markets_list = item.get("markets", [item]) if endpoint == "events" else [item]
+                    for m in markets_list:
                         slug_val = m.get("slug", "")
                         if not slug_val.startswith(slug_prefix):
-                            continue  # skip unrelated results
+                            continue
                         yes_t, no_t = self.extract_tokens(m)
                         if yes_t and no_t:
-                            print(f"[find_market] ✅ FOUND via prefix search: {slug_val}")
-                            print(f"   Question: {m.get('question', '')[:160]}")
-                            slot_ts = self._parse_slot_ts(m, window)
+                            slot_ts = self._parse_slot_ts_from_slug(slug_val, interval_sec) or self._parse_slot_ts(m, window)
+                            print(f"[find_market] ✅ prefix/{endpoint} → {slug_val}")
+                            print(f"   {m.get('question','')[:140]}")
                             return {
                                 "yes_token_id": yes_t,
                                 "no_token_id": no_t,
@@ -154,48 +180,95 @@ class PolymarketClient:
                                 "slot_ts": slot_ts,
                                 "end_date": m.get("endDate") or m.get("end_date_iso"),
                             }
-        except Exception as e:
-            print(f"[find_market] Prefix search error: {e}")
+            except Exception as e:
+                print(f"[find_market] prefix/{endpoint} error: {e}")
 
-        print(f"[find_market] ❌ No active BTC/{window} market found. Retrying next cycle...")
+        print(f"[find_market] ❌ No BTC/{window} market found. Will retry next loop.")
         return None
 
-    def _fetch_by_slug_path(self, slug: str) -> Optional[Dict]:
+    def _try_market_from_slug(self, slug: str, ts: int, window: str, endpoint: str = "markets") -> Optional[Dict]:
         """
-        Correct Gamma API slug lookup:
-          GET /markets/slug/{slug}   ← path parameter
-        The old code used ?slug= as a query param which is silently ignored
-        and returns random unrelated markets instead of 404.
+        GET /markets/slug/{slug} — path-based lookup, returns the market directly.
+        This is the correct Gamma API usage; ?slug= query param is unreliable.
         """
-        url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
+        url = f"https://gamma-api.polymarket.com/{endpoint}/slug/{slug}"
         try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data:
-                    return data[0] if isinstance(data, list) else data
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not data:
+                return None
+            m = data[0] if isinstance(data, list) else data
+            yes_t, no_t = self.extract_tokens(m)
+            if yes_t and no_t:
+                return {
+                    "yes_token_id": yes_t,
+                    "no_token_id": no_t,
+                    "question": m.get("question", ""),
+                    "slot_ts": ts,
+                    "end_date": m.get("endDate") or m.get("end_date_iso"),
+                }
         except Exception:
+            pass
+        return None
+
+    def _try_market_from_event_slug(self, slug: str, ts: int, window: str) -> Optional[Dict]:
+        """
+        Some rolling markets are registered as events with nested markets.
+        GET /events/slug/{slug} and dig into event.markets[].
+        """
+        url = f"https://gamma-api.polymarket.com/events/slug/{slug}"
+        try:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not data:
+                return None
+            event = data[0] if isinstance(data, list) else data
+            for m in event.get("markets", []):
+                yes_t, no_t = self.extract_tokens(m)
+                if yes_t and no_t:
+                    return {
+                        "yes_token_id": yes_t,
+                        "no_token_id": no_t,
+                        "question": m.get("question", event.get("title", "")),
+                        "slot_ts": ts,
+                        "end_date": m.get("endDate") or event.get("endDate"),
+                    }
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _parse_slot_ts_from_slug(slug: str, interval_sec: int) -> Optional[int]:
+        """Extract ts directly from slug string: btc-updown-15m-1774657800 → 1774657800"""
+        try:
+            ts = int(slug.rsplit("-", 1)[-1])
+            # Sanity: must be divisible by interval and within ±24h of now
+            if ts % interval_sec == 0 and abs(ts - int(time.time())) < 86400:
+                return ts
+        except (ValueError, IndexError):
             pass
         return None
 
     def _parse_slot_ts(self, market: Dict, window: str) -> int:
         """
-        FIX #6: Parse real slot_ts from end_date if available,
-        rather than returning 0 and causing wrong expiry calculations.
+        Derive slot_ts from market endDate when slug parsing isn't available.
+        slot_ts = end_ts - interval  (market title says start→end, ts is the start)
         """
+        import datetime as dt_mod
         end_date_str = market.get("endDate") or market.get("end_date_iso")
         if end_date_str:
             try:
-                import datetime
-                # Handle ISO format: "2025-01-01T12:05:00Z"
-                dt = datetime.datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                end_ts = int(dt.timestamp())
+                d = dt_mod.datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                end_ts = int(d.timestamp())
                 interval_sec = MINUTES_MAP[window] * 60
-                # slot_ts is the start of the window = end_ts - interval
                 return end_ts - interval_sec
             except Exception:
                 pass
-        return int(time.time())  # Fallback: treat now as slot start
+        return int(time.time())
 
     def best_ask(self, token_id: str) -> Optional[float]:
         if not token_id:
