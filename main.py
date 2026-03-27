@@ -74,73 +74,80 @@ class PolymarketClient:
         interval_sec = MINUTES_MAP[window] * 60
         now = int(time.time())
 
-        print(f"[find_market] Searching live BTC/{window} market... (now={now})")
+        print(f"[find_market] Searching for BTC/{window} market...")
 
-        # Very wide search - last 4+ hours
-        for offset in range(-14400, 1801, 30):   # every 30 seconds, \~4 hours back + forward
+        # Wide timestamp search based on your original logic but much broader
+        for offset in range(-14400, 1801, 30):  # every 30s over last \~4 hours + forward
             ts = ((now + offset) // interval_sec) * interval_sec
             slug = f"btc-updown-{window}-{ts}"
             market = self._fetch_by_slug(slug)
             if market:
                 yes_t, no_t = self.extract_tokens(market)
                 if yes_t and no_t:
-                    print(f"[find_market] ✅ FOUND BTC/{window} ! Timestamp: {ts}")
+                    print(f"[find_market] ✅ FOUND BTC/{window} at ts={ts}")
                     print(f"   Question: {market.get('question', '')[:160]}")
                     return {
                         "yes_token_id": yes_t,
                         "no_token_id": no_t,
                         "question": market.get("question", ""),
                         "slot_ts": ts,
+                        "end_date": market.get("endDate") or market.get("end_date_iso"),
                     }
 
-        # Last resort broad search
+        # Your original search fallback
         try:
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={"active": "true", "limit": 500},
+                params={"active": "true", "closed": "false", "limit": 500},
                 timeout=15
             )
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
                     for m in data:
-                        q = str(m.get("question", "")).lower()
+                        q = m.get("question", "").lower()
                         if "bitcoin up or down" in q and window in q:
                             yes_t, no_t = self.extract_tokens(m)
                             if yes_t and no_t:
-                                print(f"[find_market] ✅ FOUND via broad search BTC/{window}")
+                                print(f"[find_market] ✅ FOUND via search: BTC/{window}")
                                 print(f"   Question: {m.get('question','')[:160]}")
                                 return {
                                     "yes_token_id": yes_t,
                                     "no_token_id": no_t,
                                     "question": m.get("question", ""),
-                                    "slot_ts": int(time.time()),
+                                    "slot_ts": 0,
+                                    "end_date": m.get("endDate") or m.get("end_date_iso"),
                                 }
         except Exception as e:
-            print(f"[broad search error] {e}")
+            print(f"[search error] {e}")
 
-        print(f"[find_market] ❌ No BTC/{window} market found this loop. Retrying soon...")
+        print(f"[find_market] ❌ No active BTC/{window} market found this loop. Retrying...")
         return None
 
     def _fetch_by_slug(self, slug: str) -> Optional[Dict]:
         for base in ["https://gamma-api.polymarket.com/markets", "https://gamma-api.polymarket.com/events"]:
             try:
-                resp = requests.get(f"{base}?slug={slug}", timeout=8)
+                resp = requests.get(f"{base}?slug={slug}", timeout=10)
                 if resp.status_code == 200:
                     data = resp.json()
                     if data:
                         return data[0] if isinstance(data, list) else data
-            except:
+            except Exception:
                 continue
         return None
 
     def best_ask(self, token_id: str) -> Optional[float]:
+        if not token_id:
+            return None
         try:
             price = self.client.get_price(token_id, side="BUY")
             if isinstance(price, dict):
                 return float(price.get("price") or price.get("value") or 0)
             return float(price)
-        except:
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ["404", "no orderbook"]):
+                print(f"[best_ask] No orderbook ready for {token_id[:20]}...")
             return None
 
     def buy(self, token_id: str, price: float, shares: float, comment: str) -> bool:
@@ -172,7 +179,7 @@ class PolymarketClient:
             print(f"[TP FAILED] {e}")
 
 
-# BTC Price + Candle Logic
+# ── Price & Candle helpers (your requested logic) ─────────────────────────────
 def get_btc_price() -> Optional[float]:
     for url in [
         "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
@@ -222,7 +229,7 @@ def sweep_claims():
     for key, record in list(active_trades.items()):
         if record.claimed or now < record.expires_at:
             continue
-        print(f"[sweep] {key} expired — claim manually on Polymarket")
+        print(f"[sweep] {key} expired — please claim manually on Polymarket Portfolio → History")
         record.claimed = True
         del active_trades[key]
 
@@ -268,7 +275,7 @@ def check_window(client: PolymarketClient, window: str):
 
 
 def run():
-    print("[bot] BTC 5m/15m Candle Bot - Ultra Wide Search v3")
+    print("[bot] BTC 5m/15m Candle Momentum Bot (using your original market finder + wide search)")
     client = PolymarketClient()
 
     while True:
@@ -276,7 +283,7 @@ def run():
             sweep_claims()
             update_price_history()
 
-            print(f"[loop {time.strftime('%H:%M:%S')}] Checking 5m & 15m...")
+            print(f"[loop {time.strftime('%H:%M:%S')}] Checking BTC 5m & 15m...")
 
             for window in WINDOWS:
                 check_window(client, window)
@@ -284,7 +291,7 @@ def run():
             time.sleep(POLL_INTERVAL_SEC)
 
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"[CRITICAL ERROR] {e}")
             traceback.print_exc()
             time.sleep(30)
 
