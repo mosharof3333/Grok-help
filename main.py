@@ -74,17 +74,17 @@ class PolymarketClient:
         interval_sec = MINUTES_MAP[window] * 60
         now = int(time.time())
 
-        print(f"[find_market] Searching BTC/{window} (current ts \~{now})...")
+        print(f"[find_market] Searching live BTC/{window} market... (now={now})")
 
-        # Extremely wide search - last 3+ hours + forward
-        for offset in range(-10800, 1201, 30):   # every 30s, covering \~3 hours back
+        # Very wide search - last 4+ hours
+        for offset in range(-14400, 1801, 30):   # every 30 seconds, \~4 hours back + forward
             ts = ((now + offset) // interval_sec) * interval_sec
             slug = f"btc-updown-{window}-{ts}"
             market = self._fetch_by_slug(slug)
             if market:
                 yes_t, no_t = self.extract_tokens(market)
                 if yes_t and no_t:
-                    print(f"[find_market] ✅ SUCCESS! Found BTC/{window} at timestamp {ts}")
+                    print(f"[find_market] ✅ FOUND BTC/{window} ! Timestamp: {ts}")
                     print(f"   Question: {market.get('question', '')[:160]}")
                     return {
                         "yes_token_id": yes_t,
@@ -93,19 +93,22 @@ class PolymarketClient:
                         "slot_ts": ts,
                     }
 
-        # Final broad search
+        # Last resort broad search
         try:
-            resp = requests.get("https://gamma-api.polymarket.com/markets", 
-                                params={"active": "true", "limit": 500}, timeout=15)
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"active": "true", "limit": 500},
+                timeout=15
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
                     for m in data:
                         q = str(m.get("question", "")).lower()
-                        if "bitcoin up or down" in q and f"{window}" in q:
+                        if "bitcoin up or down" in q and window in q:
                             yes_t, no_t = self.extract_tokens(m)
                             if yes_t and no_t:
-                                print(f"[find_market] ✅ FOUND via broad search: BTC/{window}")
+                                print(f"[find_market] ✅ FOUND via broad search BTC/{window}")
                                 print(f"   Question: {m.get('question','')[:160]}")
                                 return {
                                     "yes_token_id": yes_t,
@@ -116,7 +119,7 @@ class PolymarketClient:
         except Exception as e:
             print(f"[broad search error] {e}")
 
-        print(f"[find_market] ❌ No BTC/{window} market found this loop.")
+        print(f"[find_market] ❌ No BTC/{window} market found this loop. Retrying soon...")
         return None
 
     def _fetch_by_slug(self, slug: str) -> Optional[Dict]:
@@ -169,7 +172,7 @@ class PolymarketClient:
             print(f"[TP FAILED] {e}")
 
 
-# Price + Candle logic (same as before)
+# BTC Price + Candle Logic
 def get_btc_price() -> Optional[float]:
     for url in [
         "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
@@ -219,7 +222,7 @@ def sweep_claims():
     for key, record in list(active_trades.items()):
         if record.claimed or now < record.expires_at:
             continue
-        print(f"[sweep] {key} expired — claim manually")
+        print(f"[sweep] {key} expired — claim manually on Polymarket")
         record.claimed = True
         del active_trades[key]
 
@@ -241,7 +244,7 @@ def check_window(client: PolymarketClient, window: str):
         return
 
     wait_sec = WAIT_SECONDS[window]
-    print(f"[SIGNAL/{window}] BTC {signal} detected — waiting {wait_sec}s...")
+    print(f"[SIGNAL/{window}] BTC {signal} detected — waiting {wait_sec}s into live candle...")
     time.sleep(wait_sec)
 
     market = client.find_current_market(window)
@@ -261,11 +264,11 @@ def check_window(client: PolymarketClient, window: str):
             side=signal,
         )
         client.place_take_profit(token_id, SHARES_PER_TRADE, f"{direction} TP")
-        print(f"[TRADE PLACED] {direction} | TP @ 0.99")
+        print(f"[TRADE PLACED] {direction} | TP set at 0.99")
 
 
 def run():
-    print("[bot] BTC 5m/15m Bot - Very Wide Timestamp Search")
+    print("[bot] BTC 5m/15m Candle Bot - Ultra Wide Search v3")
     client = PolymarketClient()
 
     while True:
@@ -273,7 +276,7 @@ def run():
             sweep_claims()
             update_price_history()
 
-            print(f"[loop {time.strftime('%H:%M:%S')}] Checking windows...")
+            print(f"[loop {time.strftime('%H:%M:%S')}] Checking 5m & 15m...")
 
             for window in WINDOWS:
                 check_window(client, window)
