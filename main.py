@@ -5,7 +5,6 @@ import traceback
 import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple
-from collections import deque
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType
@@ -28,7 +27,7 @@ WAIT_SECONDS = {"5m": 30, "15m": 360}
 MINUTES_MAP = {"5m": 5, "15m": 15}
 CANDLE_INTERVALS = {"5m": 300, "15m": 900}
 
-SHARES_PER_TRADE    = float(os.getenv("SHARES_PER_TRADE", 5.0))
+TRADE_AMOUNT_USD    = float(os.getenv("TRADE_AMOUNT_USD", 5.0))  # fixed $ spend per trade
 POLL_INTERVAL_SEC   = int(os.getenv("POLL_INTERVAL_SEC", 60))
 DRY_RUN             = os.getenv("DRY_RUN", "true").lower() == "true"
 SIGNATURE_TYPE      = int(os.getenv("SIGNATURE_TYPE", 2))
@@ -37,7 +36,6 @@ TAKE_PROFIT_PRICE   = 0.99
 # Minimum best_ask required to place a trade (avoid thin/empty orderbooks)
 MIN_ASK_PRICE = 0.05
 
-price_history: Dict[str, deque] = {w: deque(maxlen=150) for w in WINDOWS}
 active_trades: Dict[str, TradeRecord] = {}
 
 
@@ -125,7 +123,7 @@ class PolymarketClient:
         slug_prefix = f"btc-updown-{window}-"
 
         print(f"[find_market] Searching BTC/{window} | window_ts={current_ts} "
-              f"({dt_mod.datetime.utcfromtimestamp(current_ts).strftime('%H:%M UTC')})")
+              f"({dt_mod.datetime.fromtimestamp(current_ts, tz=dt_mod.timezone.utc).strftime('%H:%M UTC')})")
 
         # ── Stage 1: direct event slug lookup ────────────────────────────────
         # Try current window + next 2 (pre-created) + previous (in case of drift)
@@ -288,62 +286,112 @@ class PolymarketClient:
             print(f"[TP FAILED] {e}")
 
 
-# ── Price & Candle helpers ────────────────────────────────────────────────────
+# ── Candle helpers — real Binance OHLCV klines ───────────────────────────────
+#
+# Binance kline format (each element of the returned list):
+#   [0]  open_time  (ms)
+#   [1]  open
+#   [2]  high
+#   [3]  low
+#   [4]  close       ← we use this
+#   [5]  volume
+#   ...
+#
+# We always request limit=3 so we get:
+#   klines[-3]  two candles ago   (fully closed)
+#   klines[-2]  previous candle   (fully closed)  ← candle[-2]
+#   klines[-1]  current live candle (still open)  ← ignored for signal
+#
+# Signal logic (momentum follow):
+#   candle[-1].close > candle[-2].close  →  UP
+#   candle[-1].close < candle[-2].close  →  DOWN
+#
+# "candle[-1]" here means the most recently CLOSED candle, i.e. klines[-2]
+# because klines[-1] is the still-open current candle.
 
-def get_btc_price() -> Optional[float]:
-    for url, parser in [
-        (
-            "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
-            lambda j: float(j["price"])
-        ),
-        (
-            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
-            lambda j: float(j["bitcoin"]["usd"])
-        ),
-    ]:
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                return parser(r.json())
-        except Exception:
-            continue
-    return None
+BINANCE_INTERVAL = {"5m": "5m", "15m": "15m"}
+
+# Bybit as fallback (same kline format)
+BYBIT_INTERVAL = {"5m": "5", "15m": "15"}
 
 
-def update_price_history():
-    price = get_btc_price()
-    if price:
-        now = int(time.time())
-        for w in WINDOWS:
-            price_history[w].append((now, price))
-
-
-def get_last_two_candles(window: str) -> Tuple[Optional[float], Optional[float]]:
+def get_completed_candles(window: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    FIX #8: Added explicit warning when not enough data is accumulated yet,
-    so the silent startup blackout is visible to the operator.
-    """
-    data = list(price_history[window])
-    if len(data) < 8:
-        remaining = 8 - len(data)
-        print(f"[candles/{window}] Warming up — need {remaining} more price samples "
-              f"(~{remaining * POLL_INTERVAL_SEC}s)...")
-        return None, None
+    Fetch the last two FULLY CLOSED BTC/USDT candles for the given window
+    directly from Binance OHLCV klines API.
 
-    interval = CANDLE_INTERVALS[window]
-    now = int(time.time())
-    current_start = (now // interval) * interval
-    closes = []
-    last_start = None
-    for ts, p in reversed(data):
-        c_start = (ts // interval) * interval
-        if c_start < current_start:
-            if not closes or c_start != last_start:
-                closes.append(p)
-                last_start = c_start
-            if len(closes) >= 2:
-                break
-    return (closes[0], closes[1]) if len(closes) >= 2 else (None, None)
+    Returns (candle_minus_1_close, candle_minus_2_close) where:
+      candle_minus_1 = most recently closed candle
+      candle_minus_2 = the one before it
+
+    Signal:
+      candle_minus_1 > candle_minus_2  →  caller should BUY UP
+      candle_minus_1 < candle_minus_2  →  caller should BUY DOWN
+
+    Falls back to Bybit if Binance is unreachable.
+    """
+    # ── Primary: Binance ──────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={
+                "symbol": "BTCUSDT",
+                "interval": BINANCE_INTERVAL[window],
+                "limit": 3,          # [-3]=two ago, [-2]=last closed, [-1]=live
+            },
+            timeout=8,
+        )
+        if r.status_code == 200:
+            klines = r.json()
+            if len(klines) >= 3:
+                # klines[-1] is the still-open candle — skip it
+                c1_close = float(klines[-2][4])   # most recently closed
+                c2_close = float(klines[-3][4])   # one before that
+                c1_open_ms = klines[-2][0]
+                print(f"[candles/{window}] Binance OHLCV | "
+                      f"candle[-1] close={c1_close:.2f}  "
+                      f"candle[-2] close={c2_close:.2f}  "
+                      f"(opened {_ms_to_hhmm(c1_open_ms)} UTC)")
+                return c1_close, c2_close
+    except Exception as e:
+        print(f"[candles/{window}] Binance error: {e} — trying Bybit ...")
+
+    # ── Fallback: Bybit ───────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/kline",
+            params={
+                "category": "spot",
+                "symbol": "BTCUSDT",
+                "interval": BYBIT_INTERVAL[window],
+                "limit": 3,
+            },
+            timeout=8,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            # Bybit returns newest first: list[0] = current live, list[1] = last closed
+            klines = data.get("result", {}).get("list", [])
+            if len(klines) >= 3:
+                # klines[0] = live (skip), klines[1] = last closed, klines[2] = one before
+                # Bybit format: [startTime, open, high, low, close, volume, turnover]
+                c1_close = float(klines[1][4])
+                c2_close = float(klines[2][4])
+                print(f"[candles/{window}] Bybit OHLCV (fallback) | "
+                      f"candle[-1] close={c1_close:.2f}  "
+                      f"candle[-2] close={c2_close:.2f}")
+                return c1_close, c2_close
+    except Exception as e:
+        print(f"[candles/{window}] Bybit error: {e}")
+
+    print(f"[candles/{window}] ❌ Could not fetch candles from any source.")
+    return None, None
+
+
+def _ms_to_hhmm(ms: int) -> str:
+    """Convert millisecond timestamp to HH:MM string for log readability."""
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ms / 1000, tz=_dt.timezone.utc).strftime("%H:%M")
 
 
 def _window_expires_at(market: Dict, window: str) -> int:
@@ -384,15 +432,6 @@ def sweep_claims():
         del active_trades[key]
 
 
-async def wait_without_blocking(seconds: float, label: str):
-    """
-    FIX #9: Replaces time.sleep() with async sleep so the event loop
-    continues processing other windows and price updates during waits.
-    """
-    print(f"[wait] Sleeping {seconds}s for {label}...")
-    await asyncio.sleep(seconds)
-
-
 async def check_window(client: PolymarketClient, window: str):
     trade_key = f"BTC-{window}"
     if trade_key in active_trades and int(time.time()) < active_trades[trade_key].expires_at:
@@ -402,38 +441,51 @@ async def check_window(client: PolymarketClient, window: str):
     if not market:
         return
 
-    last_close, prev_close = get_last_two_candles(window)
-    if not last_close or not prev_close:
+    # ── Real OHLCV candle signal ──────────────────────────────────────────────
+    # c1 = most recently CLOSED candle close price
+    # c2 = the candle before that close price
+    # Momentum follow: c1 > c2 → UP,  c1 < c2 → DOWN
+    c1, c2 = get_completed_candles(window)
+    if c1 is None or c2 is None:
+        print(f"[SIGNAL/{window}] Candle data unavailable — skipping.")
+        return
+    if c1 == c2:
+        print(f"[SIGNAL/{window}] Candles equal ({c1:.2f}) — no signal, skipping.")
         return
 
-    signal = "UP" if last_close > prev_close else "DOWN" if last_close < prev_close else None
-    if not signal:
-        print(f"[SIGNAL/{window}] Candles flat — no trade.")
-        return
+    signal = "UP" if c1 > c2 else "DOWN"
+    pct_move = abs(c1 - c2) / c2 * 100
+    print(f"[SIGNAL/{window}] {'⬆' if signal == 'UP' else '⬇'} {signal} | "
+          f"c1={c1:.2f}  c2={c2:.2f}  Δ={pct_move:.3f}%")
 
     wait_sec = WAIT_SECONDS[window]
-    print(f"[SIGNAL/{window}] BTC {signal} detected — waiting {wait_sec}s into live candle...")
+    print(f"[SIGNAL/{window}] Waiting {wait_sec}s into live candle before entry ...")
+    await asyncio.sleep(wait_sec)
 
-    # FIX #9: Non-blocking wait
-    await wait_without_blocking(wait_sec, f"BTC/{window} entry")
-
+    # Re-fetch market after the wait — window may have rolled
     market = client.find_current_market(window)
     if not market:
+        print(f"[SIGNAL/{window}] Market gone after wait — skipping.")
         return
 
     token_id = market["yes_token_id"] if signal == "UP" else market["no_token_id"]
     direction = f"BTC {signal} [{window}]"
 
-    # FIX #10: Abort if orderbook is empty or price is suspiciously thin
     ask = client.best_ask(token_id)
     if ask is None:
-        print(f"[SKIP] No orderbook for {direction} — aborting trade to avoid bad fill.")
+        print(f"[SKIP] No orderbook for {direction} — aborting.")
         return
     if ask < MIN_ASK_PRICE:
-        print(f"[SKIP] Ask price {ask:.4f} too low (< {MIN_ASK_PRICE}) for {direction} — likely stale market.")
+        print(f"[SKIP] Ask {ask:.4f} too low for {direction} — stale market.")
         return
 
-    if client.buy(token_id, ask, SHARES_PER_TRADE, direction):
+    # Fixed dollar amount: shares = $TRADE_AMOUNT_USD / ask price
+    # Round down to 2 decimal places to avoid over-spending
+    shares = round(TRADE_AMOUNT_USD / ask, 2)
+    cost = shares * ask
+    print(f"[ENTRY] {direction} | ask={ask:.4f} | shares={shares} | cost≈${cost:.2f}")
+
+    if client.buy(token_id, ask, shares, direction):
         expires_at = _window_expires_at(market, window)
         active_trades[trade_key] = TradeRecord(
             window=window,
@@ -442,27 +494,23 @@ async def check_window(client: PolymarketClient, window: str):
             token_id=token_id,
             side=signal,
         )
-        client.place_take_profit(token_id, SHARES_PER_TRADE, f"{direction} TP")
-        print(f"[TRADE PLACED] {direction} | Ask={ask:.4f} | TP set at {TAKE_PROFIT_PRICE}")
+        client.place_take_profit(token_id, shares, f"{direction} TP")
+        print(f"[TRADE PLACED] {direction} | shares={shares} | cost≈${cost:.2f} | TP @ {TAKE_PROFIT_PRICE}")
 
 
 async def run_async():
-    print("[bot] BTC 5m/15m Candle Momentum Bot — Fixed edition")
+    print("[bot] BTC 5m/15m Candle Momentum Bot")
+    print(f"[bot] Dry-run={DRY_RUN} | Trade=${TRADE_AMOUNT_USD} fixed | TP={TAKE_PROFIT_PRICE} | Poll={POLL_INTERVAL_SEC}s")
     client = PolymarketClient()
 
     while True:
         try:
             sweep_claims()
-            update_price_history()
-
-            print(f"[loop {time.strftime('%H:%M:%S')}] Checking BTC 5m & 15m...")
-
-            # FIX #9: Run both window checks concurrently — neither blocks the other
+            print(f"[loop {time.strftime('%H:%M:%S')}] Checking BTC 5m & 15m ...")
             await asyncio.gather(
                 check_window(client, "5m"),
                 check_window(client, "15m"),
             )
-
             await asyncio.sleep(POLL_INTERVAL_SEC)
 
         except Exception as e:
