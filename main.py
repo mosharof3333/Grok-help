@@ -465,10 +465,30 @@ def sweep_claims():
         del active_trades[key]
 
 
+_window_lock: Dict[str, bool] = {"5m": False, "15m": False}  # prevents re-entry during wait
+
+
 async def check_window(client: PolymarketClient, window: str):
     trade_key = f"BTC-{window}"
+
+    # Guard 1: already have an active trade in this window
     if trade_key in active_trades and int(time.time()) < active_trades[trade_key].expires_at:
         return
+
+    # Guard 2: this window is already mid-execution (signal found, waiting to enter)
+    # Without this, a second loop tick during asyncio.sleep(wait_sec) would fire a second trade
+    if _window_lock[window]:
+        print(f"[{window}] Already processing — skipping duplicate trigger.")
+        return
+
+    _window_lock[window] = True
+    try:
+        await _run_window(client, window, trade_key)
+    finally:
+        _window_lock[window] = False
+
+
+async def _run_window(client: PolymarketClient, window: str, trade_key: str):
 
     market = client.find_current_market(window)
     if not market:
