@@ -80,75 +80,102 @@ class PolymarketClient:
 
     def find_current_market(self, window: str) -> Optional[Dict]:
         """
-        FIX #1 + #2 + #3 + #4: Replaced broken slug-guessing approach.
-        Now uses the Gamma API search with broad, correct keyword matching
-        against real Polymarket question text, with pagination support.
+        Two-stage market discovery:
+
+        STAGE 1 — Deterministic slug lookup (fast, O(1) API calls):
+          Real Polymarket slugs are: btc-updown-5m-{ts} / btc-updown-15m-{ts}
+          where ts = (now // interval_sec) * interval_sec  (floor to window boundary).
+          We try current window, the one just before, and the next one (in case of
+          slight clock drift or a market that opened a few seconds early).
+          The correct Gamma API path for slug lookup is:
+            GET /markets/slug/{slug}   ← path parameter, NOT ?slug= query param
+          Using ?slug= silently ignores the filter and returns unrelated markets.
+
+        STAGE 2 — Slug-prefix search fallback (catches edge cases):
+          Query GET /markets?slug=btc-updown-{window}-  (prefix match).
+          This is more reliable than keyword-scanning thousands of markets and
+          avoids pagination issues with large result sets.
         """
-        print(f"[find_market] Searching for BTC/{window} market...")
+        interval_sec = MINUTES_MAP[window] * 60
+        now = int(time.time())
+        current_window_ts = (now // interval_sec) * interval_sec
 
-        # Known keyword patterns Polymarket uses for BTC Up/Down candle markets
-        # Real questions look like: "Will BTC go up or down in the next 5 minutes?"
-        keyword_patterns = [
-            ("btc", "up or down", window),
-            ("bitcoin", "up or down", window),
-            ("btc", "5 minute" if window == "5m" else "15 minute", ""),
-            ("bitcoin", "5 minute" if window == "5m" else "15 minute", ""),
-        ]
+        print(f"[find_market] Searching for BTC/{window} market (current window ts={current_window_ts})...")
 
-        offset = 0
-        page_size = 500
-        found_any_page = True
+        # ── Stage 1: try current window, previous, and next ──────────────────
+        for ts in [current_window_ts, current_window_ts - interval_sec, current_window_ts + interval_sec]:
+            slug = f"btc-updown-{window}-{ts}"
+            market = self._fetch_by_slug_path(slug)
+            if market:
+                yes_t, no_t = self.extract_tokens(market)
+                if yes_t and no_t:
+                    print(f"[find_market] ✅ FOUND via slug lookup: {slug}")
+                    print(f"   Question: {market.get('question', '')[:160]}")
+                    return {
+                        "yes_token_id": yes_t,
+                        "no_token_id": no_t,
+                        "question": market.get("question", ""),
+                        "slot_ts": ts,
+                        "end_date": market.get("endDate") or market.get("end_date_iso"),
+                    }
 
-        while found_any_page:
-            try:
-                resp = requests.get(
-                    "https://gamma-api.polymarket.com/markets",
-                    params={
-                        "active": "true",
-                        "closed": "false",
-                        "limit": page_size,
-                        "offset": offset,
-                    },
-                    timeout=15
-                )
-                if resp.status_code != 200:
-                    print(f"[find_market] Gamma API error: {resp.status_code}")
-                    break
-
+        # ── Stage 2: prefix search as fallback ───────────────────────────────
+        slug_prefix = f"btc-updown-{window}-"
+        print(f"[find_market] Slug lookup missed — trying prefix search '{slug_prefix}'...")
+        try:
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={
+                    "slug": slug_prefix,   # Gamma supports prefix matching here
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 20,
+                    "order": "end_date_iso",
+                    "ascending": "false",  # newest first
+                },
+                timeout=15
+            )
+            if resp.status_code == 200:
                 data = resp.json()
-                if not isinstance(data, list) or len(data) == 0:
-                    found_any_page = False
-                    break
+                if isinstance(data, list):
+                    for m in data:
+                        slug_val = m.get("slug", "")
+                        if not slug_val.startswith(slug_prefix):
+                            continue  # skip unrelated results
+                        yes_t, no_t = self.extract_tokens(m)
+                        if yes_t and no_t:
+                            print(f"[find_market] ✅ FOUND via prefix search: {slug_val}")
+                            print(f"   Question: {m.get('question', '')[:160]}")
+                            slot_ts = self._parse_slot_ts(m, window)
+                            return {
+                                "yes_token_id": yes_t,
+                                "no_token_id": no_t,
+                                "question": m.get("question", ""),
+                                "slot_ts": slot_ts,
+                                "end_date": m.get("endDate") or m.get("end_date_iso"),
+                            }
+        except Exception as e:
+            print(f"[find_market] Prefix search error: {e}")
 
-                for m in data:
-                    q = m.get("question", "").lower()
-                    # Check all known keyword patterns
-                    for kw1, kw2, kw3 in keyword_patterns:
-                        if kw1 in q and kw2 in q and (not kw3 or kw3 in q):
-                            yes_t, no_t = self.extract_tokens(m)
-                            if yes_t and no_t:
-                                print(f"[find_market] ✅ FOUND via search: BTC/{window}")
-                                print(f"   Question: {m.get('question', '')[:160]}")
-                                slot_ts = self._parse_slot_ts(m, window)
-                                return {
-                                    "yes_token_id": yes_t,
-                                    "no_token_id": no_t,
-                                    "question": m.get("question", ""),
-                                    "slot_ts": slot_ts,
-                                    "end_date": m.get("endDate") or m.get("end_date_iso"),
-                                }
+        print(f"[find_market] ❌ No active BTC/{window} market found. Retrying next cycle...")
+        return None
 
-                if len(data) < page_size:
-                    # Last page reached
-                    break
-
-                offset += page_size
-
-            except Exception as e:
-                print(f"[find_market] Search error: {e}")
-                break
-
-        print(f"[find_market] ❌ No active BTC/{window} market found this loop. Retrying next cycle...")
+    def _fetch_by_slug_path(self, slug: str) -> Optional[Dict]:
+        """
+        Correct Gamma API slug lookup:
+          GET /markets/slug/{slug}   ← path parameter
+        The old code used ?slug= as a query param which is silently ignored
+        and returns random unrelated markets instead of 404.
+        """
+        url = f"https://gamma-api.polymarket.com/markets/slug/{slug}"
+        try:
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    return data[0] if isinstance(data, list) else data
+        except Exception:
+            pass
         return None
 
     def _parse_slot_ts(self, market: Dict, window: str) -> int:
