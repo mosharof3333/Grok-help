@@ -2,7 +2,6 @@ import os
 import time
 import traceback
 import requests
-import json
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 from collections import deque
@@ -58,7 +57,7 @@ class PolymarketClient:
     def extract_tokens(self, market: Dict) -> tuple[Optional[str], Optional[str]]:
         clob = market.get("clobTokenIds")
         if isinstance(clob, list) and len(clob) >= 2:
-            return str(clob[0]), str(clob[1])
+            return str(clob[0]), str(clob[1])  # YES = UP, NO = DOWN
 
         tokens = market.get("tokens", [])
         yes_id = no_id = None
@@ -75,18 +74,18 @@ class PolymarketClient:
         interval_sec = MINUTES_MAP[window] * 60
         now = int(time.time())
 
-        print(f"[find_market] Searching for live BTC/{window}...")
+        print(f"[find_market] Searching for live BTC/{window} market...")
 
-        # Much wider timestamp search to catch the current live window
-        for offset in range(-3600, 601, 60):   # check every minute in last hour + a bit forward
+        # Wide timestamp search (covers current + previous windows)
+        for offset in range(-7200, 901, 30):   # Check every 30 seconds in last 2 hours + a bit forward
             ts = ((now + offset) // interval_sec) * interval_sec
             slug = f"btc-updown-{window}-{ts}"
             market = self._fetch_by_slug(slug)
             if market:
                 yes_t, no_t = self.extract_tokens(market)
                 if yes_t and no_t:
-                    print(f"[find_market] ✅ FOUND via slug BTC/{window} (ts={ts})")
-                    print(f"   Question: {market.get('question', '')[:120]}")
+                    print(f"[find_market] ✅ FOUND via slug: BTC/{window} (ts={ts})")
+                    print(f"   Question: {market.get('question', '')[:140]}")
                     return {
                         "yes_token_id": yes_t,
                         "no_token_id": no_t,
@@ -94,7 +93,7 @@ class PolymarketClient:
                         "slot_ts": ts,
                     }
 
-        # Strong search fallback
+        # Aggressive fallback: Search recent active markets and filter
         try:
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
@@ -110,7 +109,7 @@ class PolymarketClient:
                             yes_t, no_t = self.extract_tokens(m)
                             if yes_t and no_t:
                                 print(f"[find_market] ✅ FOUND via search: BTC/{window}")
-                                print(f"   Question: {m.get('question','')[:150]}")
+                                print(f"   Question: {m.get('question','')[:140]}")
                                 return {
                                     "yes_token_id": yes_t,
                                     "no_token_id": no_t,
@@ -118,9 +117,9 @@ class PolymarketClient:
                                     "slot_ts": int(time.time()),
                                 }
         except Exception as e:
-            print(f"[search error] {e}")
+            print(f"[search fallback error] {e}")
 
-        print(f"[find_market] ❌ Still no active BTC/{window} market found. Retrying next loop...")
+        print(f"[find_market] ❌ No active BTC/{window} market found this loop. Will retry.")
         return None
 
     def _fetch_by_slug(self, slug: str) -> Optional[Dict]:
@@ -131,7 +130,7 @@ class PolymarketClient:
                     data = resp.json()
                     if data:
                         return data[0] if isinstance(data, list) else data
-            except:
+            except Exception:
                 continue
         return None
 
@@ -173,7 +172,7 @@ class PolymarketClient:
             print(f"[TP FAILED] {e}")
 
 
-# Price and candle logic
+# ── BTC Price + Candle helpers ─────────────────────────────────────────────
 def get_btc_price() -> Optional[float]:
     for url in [
         "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
@@ -223,7 +222,7 @@ def sweep_claims():
     for key, record in list(active_trades.items()):
         if record.claimed or now < record.expires_at:
             continue
-        print(f"[sweep] {key} expired — please claim manually on Polymarket")
+        print(f"[sweep] {key} expired — please claim manually")
         record.claimed = True
         del active_trades[key]
 
@@ -269,7 +268,7 @@ def check_window(client: PolymarketClient, window: str):
 
 
 def run():
-    print("[bot] BTC 5m/15m Candle Bot - Wide Timestamp Search")
+    print("[bot] BTC 5m/15m Candle Bot - Wide Timestamp + Search Fix")
     client = PolymarketClient()
 
     while True:
@@ -277,7 +276,7 @@ def run():
             sweep_claims()
             update_price_history()
 
-            print(f"[loop {time.strftime('%H:%M:%S')}] Checking BTC 5m & 15m...")
+            print(f"[loop {time.strftime('%H:%M:%S')}] Checking BTC 5m & 15m windows...")
 
             for window in WINDOWS:
                 check_window(client, window)
