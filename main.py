@@ -288,28 +288,44 @@ class PolymarketClient:
 
         return None
 
-    def buy(self, token_id: str, price: float, shares: float, comment: str) -> bool:
+    def buy(self, token_id: str, price: float, shares: float, comment: str) -> Optional[float]:
+        """
+        Place a market FOK buy order.
+        Returns the actual filled share quantity on success, None on failure.
+        DRY_RUN returns the requested shares as the simulated fill.
+        """
         if DRY_RUN:
             print(f"[DRY RUN] Market BUY → {comment} x {shares} @ ~{price:.3f}")
-            return True
+            return shares
         print(f"[MARKET BUY] {comment}")
         try:
-            # FIX #5: MarketOrderArgs does NOT accept order_type — removed it.
-            # order_type is only passed to post_order(), not the constructor.
             mo = MarketOrderArgs(token_id=token_id, amount=shares, side=BUY)
             signed = self.client.create_market_order(mo)
             resp = self.client.post_order(signed, OrderType.FOK)
             print(f"[BUY SUCCESS] {resp}")
-            return True
+
+            # Parse actual filled quantity from response
+            # Polymarket returns: {"orderID": "...", "size_matched": "7.69", ...}
+            filled = None
+            if isinstance(resp, dict):
+                raw = resp.get("size_matched") or resp.get("sizeFilled") or resp.get("filled")
+                if raw:
+                    filled = float(raw)
+            if filled and filled > 0:
+                print(f"[BUY FILLED] {filled} shares (requested {shares})")
+                return filled
+            # Fallback: assume full fill if response doesn't include fill size
+            print(f"[BUY FILLED] Fill size not in response — assuming full fill of {shares} shares")
+            return shares
         except Exception as e:
             print(f"[BUY FAILED] {e}")
-            return False
+            return None
 
     def place_take_profit(self, token_id: str, shares: float, comment: str):
         if DRY_RUN:
-            print(f"[DRY RUN] TP SELL @ {TAKE_PROFIT_PRICE} → {comment}")
+            print(f"[DRY RUN] TP SELL @ {TAKE_PROFIT_PRICE} → {comment} x {shares}")
             return
-        print(f"[TP] Placing limit sell @ {TAKE_PROFIT_PRICE} for {comment}")
+        print(f"[TP] Placing limit sell @ {TAKE_PROFIT_PRICE} | {shares} shares | {comment}")
         try:
             order = OrderArgs(token_id=token_id, price=TAKE_PROFIT_PRICE, size=shares, side=SELL)
             signed = self.client.create_order(order)
@@ -543,13 +559,11 @@ async def _run_window(client: PolymarketClient, window: str, trade_key: str):
         print(f"[SKIP] Ask {ask:.4f} too low for {direction} — stale market.")
         return
 
-    # Fixed dollar amount: shares = $TRADE_AMOUNT_USD / ask price
-    # Round down to 2 decimal places to avoid over-spending
-    shares = round(TRADE_AMOUNT_USD / ask, 2)
-    cost = shares * ask
-    print(f"[ENTRY] {direction} | ask={ask:.4f} | shares={shares} | cost≈${cost:.2f}")
+    # amount = USDC to spend (MarketOrderArgs.amount is dollars, not shares)
+    print(f"[ENTRY] {direction} | ask={ask:.4f} | spending=${TRADE_AMOUNT_USD}")
 
-    if client.buy(token_id, ask, shares, direction):
+    filled_shares = client.buy(token_id, ask, TRADE_AMOUNT_USD, direction)
+    if filled_shares is not None:
         expires_at = _window_expires_at(market, window)
         active_trades[trade_key] = TradeRecord(
             window=window,
@@ -558,8 +572,13 @@ async def _run_window(client: PolymarketClient, window: str, trade_key: str):
             token_id=token_id,
             side=signal,
         )
-        client.place_take_profit(token_id, shares, f"{direction} TP")
-        print(f"[TRADE PLACED] {direction} | shares={shares} | cost≈${cost:.2f} | TP @ {TAKE_PROFIT_PRICE}")
+        print(f"[TRADE PLACED] {direction} | filled={filled_shares} shares | spent=${TRADE_AMOUNT_USD} | TP @ {TAKE_PROFIT_PRICE}")
+
+        # Wait for shares to settle in wallet before placing the TP sell
+        # Placing a sell immediately after buy causes balance=0 error
+        print(f"[TP] Waiting 5s for fill to settle before placing TP ...")
+        await asyncio.sleep(5)
+        client.place_take_profit(token_id, filled_shares, f"{direction} TP")
 
 
 async def run_async():
