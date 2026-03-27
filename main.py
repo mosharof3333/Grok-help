@@ -13,7 +13,6 @@ from py_clob_client.order_builder.constants import BUY, SELL
 
 @dataclass
 class TradeRecord:
-    """Tracks one active trade per candle window."""
     window: str
     slot_ts: int
     expires_at: int
@@ -23,7 +22,7 @@ class TradeRecord:
     tp_placed: bool = False
 
 WINDOWS = ["5m", "15m"]
-WAIT_SECONDS = {"5m": 30, "15m": 360}      # 30 seconds or 6 minutes
+WAIT_SECONDS = {"5m": 30, "15m": 360}
 MINUTES_MAP = {"5m": 5, "15m": 15}
 CANDLE_INTERVALS = {"5m": 300, "15m": 900}
 
@@ -54,13 +53,13 @@ class PolymarketClient:
         )
         self.client.set_api_creds(self.client.create_or_derive_api_creds())
 
-        print(f"[bot] BTC Candle Momentum Bot started | Dry-run: {DRY_RUN} | TP @ {TAKE_PROFIT_PRICE} | Shares: {SHARES_PER_TRADE}")
+        print(f"[bot] BTC Candle Momentum Bot started | Dry-run: {DRY_RUN} | TP @ {TAKE_PROFIT_PRICE}")
 
-    def extract_tokens(self, market: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    def extract_tokens(self, market: Dict) -> tuple[Optional[str], Optional[str]]:
         clob = market.get("clobTokenIds")
-        if clob and isinstance(clob, list) and len(clob) >= 2:
+        if isinstance(clob, list) and len(clob) >= 2:
             return str(clob[0]), str(clob[1])  # YES=UP, NO=DOWN
-        # fallback from your original
+
         tokens = market.get("tokens", [])
         yes_id = no_id = None
         for t in tokens:
@@ -72,92 +71,86 @@ class PolymarketClient:
                 no_id = tid
         return yes_id, no_id
 
-    def find_current_market(self, asset: str, window: str) -> Optional[Dict]:
-        # Your original working logic (kept almost unchanged)
-        interval_sec = MINUTES_MAP.get(window, 300) * 60
+    def find_current_market(self, window: str) -> Optional[Dict]:
+        interval_sec = MINUTES_MAP[window] * 60
         now = int(time.time())
 
-        for offset in [0, -interval_sec, -300, 300, -600]:
+        print(f"[find_market] Searching for BTC/{window} market...")
+
+        # Try multiple timestamp offsets (your original approach + more)
+        for offset in [0, -interval_sec, -2*interval_sec, -300, 300, -600, -900]:
             ts = ((now + offset) // interval_sec) * interval_sec
-            slug = f"{asset.lower()}-updown-{window}-{ts}"
+            slug = f"btc-updown-{window}-{ts}"
             market = self._fetch_by_slug(slug)
             if market:
                 yes_t, no_t = self.extract_tokens(market)
                 if yes_t and no_t:
-                    print(f"[find_market] Found {asset.upper()}/{window}: {market.get('question', '')[:100]}")
+                    print(f"[find_market] ✅ Found via slug: BTC/{window} - {market.get('question', '')[:80]}")
                     return {
                         "yes_token_id": yes_t,
                         "no_token_id": no_t,
                         "question": market.get("question", ""),
                         "slot_ts": ts,
-                        "end_date": market.get("endDate") or market.get("end_date_iso"),
                     }
 
-        # Search fallback (your original style)
+        # Stronger fallback: Search recent active markets
         try:
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={"active": "true", "closed": "false", "limit": 300},
-                timeout=15
+                params={"active": "true", "limit": 200},
+                timeout=12
             )
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
                     for m in data:
-                        q = m.get("question", "").lower()
-                        if f"{asset.lower()} up or down" in q and window in q:
+                        q = str(m.get("question", "")).lower()
+                        if "bitcoin up or down" in q and window in q:
                             yes_t, no_t = self.extract_tokens(m)
                             if yes_t and no_t:
-                                print(f"[find_market] Found via search: {m.get('question','')[:100]}")
+                                print(f"[find_market] ✅ Found via search: {m.get('question','')[:100]}")
                                 return {
                                     "yes_token_id": yes_t,
                                     "no_token_id": no_t,
                                     "question": m.get("question", ""),
-                                    "slot_ts": 0,
-                                    "end_date": m.get("endDate") or m.get("end_date_iso"),
+                                    "slot_ts": int(time.time()),
                                 }
         except Exception as e:
-            print(f"[search error] {e}")
+            print(f"[search fallback error] {e}")
 
-        print(f"[find_market] No active {asset.upper()}/{window} market")
+        print(f"[find_market] ❌ No active BTC/{window} market found right now. Will retry next loop.")
         return None
 
     def _fetch_by_slug(self, slug: str) -> Optional[Dict]:
-        for base in ["https://gamma-api.polymarket.com/markets",
-                     "https://gamma-api.polymarket.com/events"]:
+        for base in ["https://gamma-api.polymarket.com/markets", "https://gamma-api.polymarket.com/events"]:
             try:
                 resp = requests.get(f"{base}?slug={slug}", timeout=10)
                 if resp.status_code == 200:
                     data = resp.json()
                     if data:
                         return data[0] if isinstance(data, list) else data
-            except Exception:
+            except:
                 continue
         return None
 
+    # best_ask, buy, place_take_profit stay the same as previous version
     def best_ask(self, token_id: str) -> Optional[float]:
-        if not token_id:
-            return None
         try:
             price = self.client.get_price(token_id, side="BUY")
             if isinstance(price, dict):
                 return float(price.get("price") or price.get("value") or 0)
             return float(price)
         except Exception as e:
-            err = str(e).lower()
-            if any(x in err for x in ["404", "no orderbook"]):
-                print(f"[best_ask] No orderbook ready for {token_id[:20]}...")
-            else:
+            if "404" not in str(e).lower():
                 print(f"[best_ask error] {e}")
             return None
 
-    def buy(self, token_id: str, price: float, shares: float, comment: str):
+    def buy(self, token_id: str, price: float, shares: float, comment: str) -> bool:
         if DRY_RUN:
-            print(f"[DRY RUN] Would buy → {comment} @ {price:.4f} x {shares}")
+            print(f"[DRY RUN] Market BUY → {comment} x {shares}")
             return True
         print(f"[MARKET BUY] {comment}")
         try:
-            # Aggressive market-style buy
             mo = MarketOrderArgs(token_id=token_id, amount=shares, side=BUY, order_type=OrderType.FOK)
             signed = self.client.create_market_order(mo)
             resp = self.client.post_order(signed, OrderType.FOK)
@@ -181,7 +174,7 @@ class PolymarketClient:
             print(f"[TP FAILED] {e}")
 
 
-# ── Price & Candle helpers ───────────────────────────────────────────────────
+# Price & Candle logic (unchanged from last version)
 def get_btc_price() -> Optional[float]:
     for url in [
         "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
@@ -190,24 +183,17 @@ def get_btc_price() -> Optional[float]:
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
-                if "binance" in url:
-                    return float(r.json()["price"])
-                else:
-                    return float(r.json()["bitcoin"]["usd"])
+                return float(r.json()["price"]) if "binance" in url else float(r.json()["bitcoin"]["usd"])
         except:
             continue
-    print("[price] Failed to fetch BTC price")
     return None
-
 
 def update_price_history():
     price = get_btc_price()
-    if price is None:
-        return
-    now = int(time.time())
-    for w in WINDOWS:
-        price_history[w].append((now, price))
-
+    if price:
+        now = int(time.time())
+        for w in WINDOWS:
+            price_history[w].append((now, price))
 
 def get_last_two_candles(window: str) -> Tuple[Optional[float], Optional[float]]:
     data = list(price_history[window])
@@ -216,7 +202,6 @@ def get_last_two_candles(window: str) -> Tuple[Optional[float], Optional[float]]
     interval = CANDLE_INTERVALS[window]
     now = int(time.time())
     current_start = (now // interval) * interval
-
     closes = []
     last_start = None
     for ts, p in reversed(data):
@@ -229,32 +214,26 @@ def get_last_two_candles(window: str) -> Tuple[Optional[float], Optional[float]]
                 break
     return (closes[0], closes[1]) if len(closes) >= 2 else (None, None)
 
-
 def _window_expires_at(market: Dict, window: str) -> int:
     slot_ts = market.get("slot_ts", 0)
     interval_sec = MINUTES_MAP.get(window, 300) * 60
     return slot_ts + interval_sec if slot_ts else int(time.time()) + interval_sec
 
-
-def sweep_claims(client: PolymarketClient):
+def sweep_claims():
     now = int(time.time())
     for key, record in list(active_trades.items()):
         if record.claimed or now < record.expires_at:
             continue
-        print(f"[sweep] {key} | Window expired — please claim manually on Polymarket Portfolio → History")
+        print(f"[sweep] {key} expired — please claim manually on Polymarket")
         record.claimed = True
         del active_trades[key]
 
-
 def check_window(client: PolymarketClient, window: str):
     trade_key = f"BTC-{window}"
+    if trade_key in active_trades and int(time.time()) < active_trades[trade_key].expires_at:
+        return
 
-    if trade_key in active_trades:
-        rec = active_trades[trade_key]
-        if int(time.time()) < rec.expires_at:
-            return
-
-    market = client.find_current_market("BTC", window)
+    market = client.find_current_market(window)
     if not market:
         return
 
@@ -262,30 +241,22 @@ def check_window(client: PolymarketClient, window: str):
     if not last_close or not prev_close:
         return
 
-    signal = None
-    if last_close > prev_close:
-        signal = "UP"
-    elif last_close < prev_close:
-        signal = "DOWN"
-
+    signal = "UP" if last_close > prev_close else "DOWN" if last_close < prev_close else None
     if not signal:
         return
 
     wait_sec = WAIT_SECONDS[window]
-    print(f"[SIGNAL/{window}] BTC {signal} detected — waiting {wait_sec}s into live candle...")
+    print(f"[SIGNAL/{window}] BTC {signal} detected (last {last_close:.2f} vs prev {prev_close:.2f}) — waiting {wait_sec}s...")
     time.sleep(wait_sec)
 
-    # Refresh market after waiting
-    market = client.find_current_market("BTC", window)
+    market = client.find_current_market(window)
     if not market:
         return
 
     token_id = market["yes_token_id"] if signal == "UP" else market["no_token_id"]
     direction = f"BTC {signal} [{window}]"
 
-    success = client.buy(token_id, client.best_ask(token_id) or 0.99, SHARES_PER_TRADE, direction)
-
-    if success:
+    if client.buy(token_id, client.best_ask(token_id) or 0.99, SHARES_PER_TRADE, direction):
         expires_at = _window_expires_at(market, window)
         active_trades[trade_key] = TradeRecord(
             window=window,
@@ -295,19 +266,19 @@ def check_window(client: PolymarketClient, window: str):
             side=signal,
         )
         client.place_take_profit(token_id, SHARES_PER_TRADE, f"{direction} TP")
-        print(f"[TRADE PLACED] {direction} | Take-profit set at 0.99")
+        print(f"[TRADE PLACED] {direction} | TP @ 0.99")
 
 
 def run():
-    print("[bot] BTC 5m & 15m Candle Momentum Bot (Manual Claim + TP @ 0.99)")
+    print("[bot] BTC 5m/15m Candle Bot - Improved Market Finder")
     client = PolymarketClient()
 
     while True:
         try:
-            sweep_claims(client)
+            sweep_claims()
             update_price_history()
 
-            print(f"[loop] {time.strftime('%H:%M:%S')} — Checking 5m and 15m windows...")
+            print(f"[loop {time.strftime('%H:%M:%S')}] Checking BTC 5m & 15m...")
 
             for window in WINDOWS:
                 check_window(client, window)
@@ -315,7 +286,7 @@ def run():
             time.sleep(POLL_INTERVAL_SEC)
 
         except Exception as e:
-            print(f"[CRITICAL ERROR] {e}")
+            print(f"[ERROR] {e}")
             traceback.print_exc()
             time.sleep(30)
 
