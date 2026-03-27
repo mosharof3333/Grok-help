@@ -239,21 +239,54 @@ class PolymarketClient:
                 pass
         return int(time.time())
 
-    def best_ask(self, token_id: str) -> Optional[float]:
+    def best_ask(self, token_id: str, label: str = "") -> Optional[float]:
+        """
+        Get the best ask price for a token.
+        Tries two methods:
+          1. CLOB get_price  (fast, single value)
+          2. CLOB /book endpoint  (full orderbook — works even when get_price returns 404)
+        """
         if not token_id:
             return None
+
+        tag = f"[{label}] " if label else ""
+
+        # ── Method 1: get_price ───────────────────────────────────────────────
         try:
             price = self.client.get_price(token_id, side="BUY")
             if isinstance(price, dict):
                 p = float(price.get("price") or price.get("value") or 0)
             else:
                 p = float(price)
-            return p if p > 0 else None
+            if p > 0:
+                print(f"[best_ask] {tag}token={token_id[:16]}... ask={p:.4f} (via get_price)")
+                return p
         except Exception as e:
-            err = str(e).lower()
-            if any(x in err for x in ["404", "no orderbook"]):
-                print(f"[best_ask] No orderbook ready for {token_id[:20]}...")
-            return None
+            print(f"[best_ask] {tag}get_price failed: {e} — trying /book ...")
+
+        # ── Method 2: raw CLOB /book endpoint ────────────────────────────────
+        try:
+            r = requests.get(
+                f"{self.host}/book",
+                params={"token_id": token_id},
+                timeout=8
+            )
+            if r.status_code == 200:
+                book = r.json()
+                asks = book.get("asks", [])
+                if asks:
+                    # asks are sorted best (lowest) first
+                    best = float(asks[0].get("price", 0))
+                    if best > 0:
+                        print(f"[best_ask] {tag}token={token_id[:16]}... ask={best:.4f} (via /book, {len(asks)} levels)")
+                        return best
+                print(f"[best_ask] {tag}token={token_id[:16]}... /book returned empty asks")
+            else:
+                print(f"[best_ask] {tag}token={token_id[:16]}... /book HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[best_ask] {tag}/book failed: {e}")
+
+        return None
 
     def buy(self, token_id: str, price: float, shares: float, comment: str) -> bool:
         if DRY_RUN:
@@ -471,8 +504,19 @@ async def check_window(client: PolymarketClient, window: str):
     token_id = market["yes_token_id"] if signal == "UP" else market["no_token_id"]
     direction = f"BTC {signal} [{window}]"
 
-    ask = client.best_ask(token_id)
+    # Log both token IDs so we can verify which one is UP vs DOWN
+    print(f"[tokens/{window}] YES/UP  token: {market['yes_token_id'][:24]}...")
+    print(f"[tokens/{window}] NO/DOWN token: {market['no_token_id'][:24]}...")
+    print(f"[tokens/{window}] Using {signal} token: {token_id[:24]}...")
+
+    ask = client.best_ask(token_id, label=signal)
     if ask is None:
+        # Check the opposite token to diagnose whether it's a token-order issue
+        other_id = market["no_token_id"] if signal == "UP" else market["yes_token_id"]
+        other_ask = client.best_ask(other_id, label=f"OTHER({'DOWN' if signal=='UP' else 'UP'})")
+        if other_ask is not None:
+            print(f"[WARN] {signal} token has no orderbook but the opposite token does "
+                  f"(ask={other_ask:.4f}). Token index 0/1 mapping may be inverted for this market.")
         print(f"[SKIP] No orderbook for {direction} — aborting.")
         return
     if ask < MIN_ASK_PRICE:
